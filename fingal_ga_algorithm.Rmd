@@ -1,0 +1,358 @@
+---
+title: "Gestational Age Approximation Algorithm"
+author: "Zlatan Feric"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(sqldf)
+library(corrplot)
+library(RODBC)
+
+print(getwd())
+# RODBC Conenction
+db <- odbcConnect()
+
+# status form 
+status <- data.frame(
+          sqlQuery(db, 'select  sys_loc_code as studyid, * from [PROTECT_E].[dbo].[dt_status] where status = 1')
+          )
+
+status$DATE_STATUS <- as.Date(status$DATE_STATUS, format = "%m/%d/%Y")
+
+is <- data.frame(
+          sqlQuery(db, 'select  sys_loc_code as studyid, islmpdate from [PROTECT_E].[dbo].[dt_screening]')
+          )
+
+is <- is[!is.na(is$islmpdate),]
+
+fc <- data.frame(
+          sqlQuery(db, 'select SYS_LOC_CODE, FC_EDD, FC_FISCAN_DATE from [PROTECT_E].[dbo].[dt_edd_confirmation]')
+)
+
+fc2 <- read.csv('Export fcedd fcfiscandate 11.20.18 ZRP.csv')
+
+fc2$FC_FISCAN_DATE <- as.Date(fc2$FC_FISCAN_DATE,"%m/%d/%Y")
+
+fc2$FC_EDD<- as.Date(fc2$FC_EDD,"%m/%d/%Y")
+
+fc <- fc2
+pp <- data.frame(
+          sqlQuery(db, 'select SYS_LOC_CODE as studyid, * from [PROTECT_E].[dbo].[dt_postpartum_data_abstraction]')
+)
+
+```
+
+1.	Pregnancies must be complete (status=1)
+
+Count of Pregnancies N:
+```{r cars}
+N_pp <- length(unique(status[status$STATUS == 1,'studyid']))
+
+print(N_pp)
+```
+```{r}
+id_miss_date_status = status[status$STATUS == 1 & is.na(status$DATE_STATUS),c('studyid')]
+
+length(id_miss_date_status)
+```
+
+2.	Remove missing for "islmpdate"
+
+```{r}
+is2 <- is[!is.na(is$islmpdate),]
+miss_is <- is[is.na(is$islmpdate),]
+print(length(miss_is))
+```
+
+```{r}
+nrow(is[!is.null(is$islmpdate) & 
+          !is.na(is$islmpdate) & 
+          as.character(is$islmpdate) != '',])
+```
+
+3.	Create new variable to represent estimated date of delivery based on LMP, called "lmp_edd": islmpdate+280
++
+4.	For ppdatedel:
+.	Impute missing with "date_satus" -- missing this variable
+.	Delete subjects that are now missing ppdatedel
+.	N=1020 (14 missing ppdatedel)
+
+```{r}
+#Changed to merge on all because any one form does not have all ids.
+
+#left join postpartum (ppdatedel) onto initial screening
+
+is_1 <- merge(is, pp, by = 'studyid', all = TRUE)
+
+#left join stats form onto previous join to get ppdadel, date_status
+
+is_2 <- merge(is_1, status, by = 'studyid', all = TRUE)
+
+#############################################################
+
+is_2 <- is_2 %>%
+  mutate(PPDATEDEL = ifelse(is.na(PPDATEDEL), as.character(DATE_STATUS), as.character(PPDATEDEL))) %>%
+  filter(!is.na(PPDATEDEL)) %>%
+  mutate(lmp_edd = islmpdate + 280)
+
+print('sample size')
+print(nrow(is_2))
+
+```
+
+```{r}
+#keep only the following columns
+
+colkeep = c('studyid','lmp_edd', 'islmpdate', 'PPDATEDEL','PREGN_OUTCOME')
+
+new_frame <- is_2[, colkeep]
+print('sample size')
+nrow(new_frame)
+```
+5.	Create new variable to represent final gestational age at delivery based on LMP, called  "finalga_lmp": (ppdatedel-islmpdate)/7
+.	CHECK: 
+.	If finalga_lmp<20+pregn_outcome=5 (pending delivery confirmation), remove from dataset 
+.	If finalga_lmp<20+pregn_outcome=1 or 2, remove from dataset
+.	CHECK: 
+.	If finalga_lmp>5
+```{r}
+#create the variable finalga_lmp
+new_frame$islmpdate <- as.Date(new_frame$islmpdate)
+new_frame$PPDATEDEL <- as.Date(new_frame$PPDATEDEL)
+
+print(nrow(new_frame[is.na(new_frame$islmpdate),]))
+new_frame <- new_frame[!is.na(new_frame$islmpdate),]
+
+new_frame2 <- new_frame %>%
+  mutate(finalga_lmp = (PPDATEDEL-islmpdate) / 7)
+```
+
+```{r}
+#check 
+check1 <- new_frame2[(new_frame2$finalga_lmp < 20 & new_frame2$PREGN_OUTCOME==5), ]
+
+new_frame3 <- new_frame2[!(new_frame2$finalga_lmp < 20 & new_frame2$PREGN_OUTCOME==5), ]
+
+check2 <- new_frame3[new_frame3$finalga_lmp < 20 & new_frame3$PREGN_OUTCOME %in% c(1,2), ]
+
+new_frame3 <- new_frame3[!(new_frame3$finalga_lmp < 20 & new_frame3$PREGN_OUTCOME %in% c(1,2)),]
+
+################################################
+
+check3 <- new_frame3[new_frame3$finalga_lmp >= 43,]
+
+new_frame3 <- new_frame3[new_frame3$finalga_lmp < 43,]
+
+print(nrow(new_frame3))
+```
+
+6.	If fc_edd missing, then delete observations for fc_fiscan_date. Zaira thinks that some of these early ultrasounds were for detecting heartbeat and actually did not estimate gestational age; we will have to go back in to get first ultrasound with estimate of gestational age for these. 
+
+```{r}
+check4 = fc[is.na(fc$FC_EDD),]
+
+fc_filtered <- fc %>%
+  filter(!is.na(FC_EDD))
+
+```
+
+7.	Create new variable to represent gestational age at first ultrasound based on LMP, called "us_ga_lmp": (fc_fiscan_date-islmpdate)/7
+
+
+```{r}
+new_frame4 <- new_frame3 %>%
+  left_join(fc_filtered, by=c("studyid"="SYS_LOC_CODE"))
+
+new_frame4 <- new_frame4 %>%
+  mutate(us_ga_lmp = (as.Date(as.character(FC_FISCAN_DATE)) - islmpdate)/7)
+```
+
+
+If us_ga_lmp<4, delete observations for: fc_edd, us_ga_lmp, and fc_fiscan_date. 
+NOTE: do not remove the subject, just the observations for the ultrasound variables. (n=1, studyid: 7097)
+
+If us_ga_lmp>28, delete observations for: fc_edd, us_ga_lmp, and fc_fiscan_date.
+NOTE: do not remove the subject, just the observations for the ultrasound variables. (n = 10, studyid: 3045, 7025, 7026, 7029, 7048, 7049, 7073, 7087, 7089, 7110)
+
+```{r}
+check5 = new_frame4[new_frame4$us_ga_lmp < 4,]
+check5 = check5[!is.na(check5$us_ga_lmp),]
+
+print(nrow(check5))
+new_frame5 <- new_frame4 %>%
+  mutate( FC_EDD = if_else ( us_ga_lmp < 4 & !is.na(us_ga_lmp), NA_character_ , as.character(as.Date(as.character(FC_EDD)))),
+         us_ga_lmp = ifelse ( us_ga_lmp< 4 & !is.na(us_ga_lmp), NA, us_ga_lmp),
+         FC_FISCAN_DATE = if_else ( us_ga_lmp < 4  & !is.na(us_ga_lmp), NA_character_, as.character(FC_FISCAN_DATE))
+  )
+    
+check6 = new_frame5[new_frame5$us_ga_lmp > 28,]
+check6 = check6[!is.na(check6$us_ga_lmp),]
+print(nrow(check6))  
+
+new_frame6 <- new_frame5 %>%
+  mutate( FC_EDD = if_else ( us_ga_lmp > 28, NA_character_, FC_EDD),
+          us_ga_lmp = ifelse ( us_ga_lmp > 28, NA , us_ga_lmp),
+          FC_FISCAN_DATE = if_else ( us_ga_lmp > 28, NA_character_ , as.character(FC_FISCAN_DATE))
+  )
+```
+
+8.	Create new variable to represent gestational age at first ultrasound ACOG cutoffs (used to determine whether to use LMP or ultrasound gestational age variable) 
+
+.	0=before 9 weeks
+.	1=9 weeks to <16 weeks
+.	2=16 weeks to <22 weeks
+.	3=22 weeks to <28 weeks
+
+```{r}
+new_frame7 <- new_frame6 %>%
+  mutate( acog_usga_cat = ifelse (new_frame6$us_ga_lmp < 9, 0, 
+                                  ifelse(new_frame6$us_ga_lmp >= 9 &  new_frame6$us_ga_lmp < 16, 1,
+                                   ifelse(new_frame6$us_ga_lmp >= 16 & new_frame6$us_ga_lmp < 22, 2,
+                                   ifelse(new_frame6$us_ga_lmp >= 22 & new_frame6$us_ga_lmp < 28, 3, NA)))
+                                  )
+)
+print(nrow(new_frame7[!is.na(new_frame7$acog_usga_cat),]))
+
+for (cat in c('0','1','2','3',NA)) {
+
+  d = as.character( nrow(new_frame7[!is.na(new_frame7$acog_usga_cat) 
+                        & new_frame7$acog_usga_cat == cat,]))
+  
+  print(paste0('cat-',cat,'->',d))
+}
+```
+
+9.	Create new variable to represent final gestational age based on ultrasound in weeks "finalga_us": (280-(fc_edd-ppdatedel))/7
+.	CHECK:z
+.	If finalga_us<20, remove ultrasound dating variables (n = 0)
+.	If finalga_us>43, remove ultrasound dating variables (n = 0) 
+
+
+```{r}
+new_frame7 <- new_frame7 %>%
+  mutate( finalga_us = abs((280 - as.numeric (( as.Date(as.character(new_frame7$FC_EDD)) - new_frame7$PPDATEDEL)))) / 7 
+    )
+check7 <- new_frame7[(new_frame7$finalga_us < 23) & (!is.na(new_frame7$finalga_us)),]
+
+check8 <- new_frame7[(new_frame7$finalga_us > 43) & (!is.na(new_frame7$finalga_us)),]
+
+new_frame7 <- new_frame7 %>%
+  mutate( finalga_us  = ifelse( finalga_us <= 43, finalga_us, NA))
+
+new_frame7 <- new_frame7 %>%
+  mutate( finalga_us  = ifelse( finalga_us >= 23, finalga_us, NA))
+```
+
+10.	Create new variable to represent the absolute difference between final gestational age based on ultrasound (finalga_us) and final gestational age based on lmp (finalga_lmp) "edd_diff": abs(fc_edd-lmp_edd)
+
+** Here I coded lmp_edd but might need to do it earlier before filtering
+
+```{r}
+new_frame7 <- new_frame7 %>%
+  mutate( edd_diff = abs(as.numeric( 
+    as.Date(new_frame7$FC_EDD) - new_frame7$lmp_edd))
+  )
+```
+
+11.	Create new variable to indicate whether the best EDD based on LMP or US using ACOG criteria. Create indicator variable "best_edd_cat": 0=LMP EDD; 1=US EDD. Also create variable to represent best gestational age estimate based on ACOG definition "best_edd" based on the following criteria:
+
+.	If acog_usga_cat=0 and edd_diff<=5 then best_edd=lmp_edd;
+.	If acog_usga_cat=0 and edd_diff>5 then best_edd=fc_edd;
+.	if acog_usga_cat=1 and edd_diff<=7 then best_edd=lmp_edd;
+.	if acog_usga_cat=1 and edd_diff>7 then best_edd=fc_edd;
+.	if acog_usga_cat=2 and edd_diff<10 then best_edd=lmp_edd;
+.	if acog_usga_cat=2 and edd_diff>=10 then best_edd=fc_edd;
+.	if acog_usga_cat=3 and edd_diff<=14 then best_edd=lmp_edd;
+.	if acog_usga_cat=3 and edd_diff>14 then best_edd=fc_edd;
+.	if edd_diff=missing, then best_edd=lmp_edd.
+
+
+```{r}
+new_frame8 <- new_frame7 %>%
+  mutate( best_edd = 
+            ifelse(acog_usga_cat == 0 & edd_diff <= 5 & !is.na(edd_diff) & !is.na(acog_usga_cat), as.character(lmp_edd), 
+            ifelse(acog_usga_cat == 0 & edd_diff > 5 & !is.na(FC_EDD) & !is.na(edd_diff) & !is.na(acog_usga_cat), as.character(FC_EDD),
+            ifelse(acog_usga_cat == 1 & edd_diff <= 7 & !is.na(edd_diff) & !is.na(acog_usga_cat), as.character(lmp_edd),
+            ifelse(acog_usga_cat == 1 & edd_diff > 7 & !is.na(FC_EDD) & !is.na(edd_diff) & !is.na(acog_usga_cat), as.character(FC_EDD),
+            ifelse(acog_usga_cat == 2 & edd_diff < 10 & !is.na(edd_diff) & !is.na(acog_usga_cat), as.character(lmp_edd),
+            ifelse(acog_usga_cat == 2 & edd_diff >= 10 & !is.na(FC_EDD) & !is.na(edd_diff) & !is.na(acog_usga_cat), as.character(FC_EDD),
+            ifelse(acog_usga_cat == 3 & edd_diff <= 14 & !is.na(edd_diff) & !is.na(acog_usga_cat), as.character(lmp_edd),
+            ifelse(acog_usga_cat == 3 & edd_diff > 14 & !is.na(FC_EDD) & !is.na(edd_diff) & !is.na(acog_usga_cat), as.character(FC_EDD),
+            as.character(lmp_edd))))))))))
+
+
+new_frame9 <- new_frame8 %>%
+  mutate( best_edd_cat = 
+            ifelse(acog_usga_cat == 0 & edd_diff <= 5 & !is.na(edd_diff) & !is.na(acog_usga_cat), 0, 
+            ifelse(acog_usga_cat == 0 & edd_diff > 5 & !is.na(FC_EDD) & !is.na(edd_diff) & !is.na(acog_usga_cat), 1,
+            ifelse(acog_usga_cat == 1 & edd_diff <= 7 & !is.na(edd_diff) & !is.na(acog_usga_cat), 0,
+            ifelse(acog_usga_cat == 1 & edd_diff > 7 & !is.na(FC_EDD) & !is.na(edd_diff) & !is.na(acog_usga_cat), 1,
+            ifelse(acog_usga_cat == 2 & edd_diff < 10 & !is.na(edd_diff) & !is.na(acog_usga_cat), 0,
+            ifelse(acog_usga_cat == 2 & edd_diff >= 10 & !is.na(FC_EDD) & !is.na(edd_diff) & !is.na(acog_usga_cat), 1,
+            ifelse(acog_usga_cat == 3 & edd_diff <= 14 & !is.na(edd_diff) & !is.na(acog_usga_cat), 0,
+            ifelse(acog_usga_cat == 3 & edd_diff > 14 & !is.na(FC_EDD) & !is.na(edd_diff) & !is.na(acog_usga_cat), 1,
+            0)))))))))
+
+for (cat in c('0','1','2','3',NA)) {
+
+  d = as.character( nrow(new_frame7[!is.na(new_frame7$acog_usga_cat) 
+                        & new_frame7$acog_usga_cat == cat,]))
+  
+  print(paste0('cat-',cat,'->',d))
+}
+```
+
+
+```{r}
+new_frame8 <- new_frame8 %>%
+  mutate( best_edd_cat = 
+            ifelse(acog_usga_cat == 0 & edd_diff <= 5 & !is.na(edd_diff) & !is.na(acog_usga_cat), 0, 
+            ifelse(acog_usga_cat == 0 & edd_diff > 5 & !is.na(edd_diff) & !is.na(acog_usga_cat), 1,
+            ifelse(acog_usga_cat == 1 & edd_diff <= 7 & !is.na(edd_diff) & !is.na(acog_usga_cat), 0,
+            ifelse(acog_usga_cat == 1 & edd_diff > 7 & !is.na(edd_diff) & !is.na(acog_usga_cat), 1,
+            ifelse(acog_usga_cat == 2 & edd_diff < 10 & !is.na(edd_diff) & !is.na(acog_usga_cat), 0,
+            ifelse(acog_usga_cat == 2 & edd_diff >= 10 & !is.na(edd_diff) & !is.na(acog_usga_cat), 1,
+            ifelse(acog_usga_cat == 3 & edd_diff <= 14 & !is.na(edd_diff) & !is.na(acog_usga_cat), 0,
+            ifelse(acog_usga_cat == 3 & edd_diff > 14 & !is.na(edd_diff) & !is.na(acog_usga_cat), 1,
+            0)))))))))
+
+compare <- new_frame8 %>%
+  right_join(pp_kelly, by='studyid')
+```
+
+
+12.	Create a new variable to represent the best estimate of final gestational age "finalga_best": (280-(best_edd-ppdatedel))/7
+
+
+```{r}
+new_frame8 <- new_frame8 %>%
+  mutate( finalga_best = ((280 - (as.Date(best_edd) - PPDATEDEL))) / 7 )
+```
+
+13.	Create a new variable to represent the best estimate of preterm based on delivery before 37 weeks for each estimate "preterm_us" among live births (pregn_outcome = 1, 2, 5)
+	"preterm_us": if pregn_outcome=1,2 or 5 and finalga_us<37, then preterm_us=1; if pregn_outcome=1,2, or 5 and finalga_us>=37, then preterm_us=0; else, preterm_us=missing.
+	"preterm_lmp": if pregn_outcome=1,2 or 5 and finalga_lmp<37, then preterm_lmp=1; if pregn_outcome=1,2, or 5 and finalga_lmp>=37, then preterm_lmp=0; else, preterm_lmp=missing.
+	"preterm_best": if pregn_outcome=1,2 or 5 and finalga_best<37, then preterm_best=1; if pregn_outcome=1,2, or 5 and finalga_best>=37, then preterm_best=0; else, preterm_best=missing.
+
+
+```{r}
+new_frame8 <- new_frame8 %>%
+  mutate(preterm_us = ifelse( PREGN_OUTCOME %in% c('1','2','5') & finalga_us< 37, 1, 
+                      ifelse( PREGN_OUTCOME %in% c('1','2','5') & finalga_us>= 37,0, NA ) ))
+new_frame8 <- new_frame8 %>%  
+mutate(preterm_lmp = ifelse( PREGN_OUTCOME %in% c('1','2','5') & finalga_lmp< 37, 1, 
+                      ifelse( PREGN_OUTCOME %in% c('1','2','5') & finalga_lmp>= 37,0, NA ) ))
+
+new_frame8 <- new_frame8 %>%
+  mutate(preterm_best = ifelse( PREGN_OUTCOME %in% c('1','2','5') & finalga_best< 37, 1, 
+                      ifelse( PREGN_OUTCOME %in% c('1','2','5') & finalga_best>= 37,0, NA ) ))
+
+
+
+## final result
+
+final_ga <- new_frame8
+```
