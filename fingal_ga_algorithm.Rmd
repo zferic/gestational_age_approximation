@@ -32,11 +32,6 @@ fc <- data.frame(
           sqlQuery(db, 'select SYS_LOC_CODE, FC_EDD, FC_FISCAN_DATE from [PROTECT_E].[dbo].[dt_edd_confirmation]')
 )
 
-fc2 <- read.csv('Export fcedd fcfiscandate 11.20.18 ZRP.csv')
-
-fc2$FC_FISCAN_DATE <- as.Date(fc2$FC_FISCAN_DATE,"%m/%d/%Y")
-
-fc2$FC_EDD<- as.Date(fc2$FC_EDD,"%m/%d/%Y")
 
 fc <- fc2
 pp <- data.frame(
